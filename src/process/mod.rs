@@ -11,7 +11,7 @@ use crate::{
 };
 
 use std::{
-    collections::HashSet, env, fs::File, path::PathBuf, sync::{Arc, Mutex}, thread, time::Duration,
+    collections::{HashSet, HashMap}, env, fs::File, path::PathBuf, sync::{Arc, Mutex}, thread, time::Duration,
 };
 
 use nix::{
@@ -753,6 +753,7 @@ pub fn process_find_children(parent_pid: i64) -> Vec<i64> {
         match unix::native_processes() {
             Ok(processes) => {
                 // Build parent->children map in single pass
+
                 let mut parent_map: HashMap<i64, Vec<i64>> = HashMap::new();
 
                 processes.iter().for_each(|process| {
