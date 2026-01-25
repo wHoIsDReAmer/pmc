@@ -557,6 +557,14 @@ impl Runner {
                 }
             }
 
+            if unix::NativeProcess::new(pid_to_check as u32).is_ok() {
+                let children = process_find_children(pid_to_check);
+                for pid in children {
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                }
+                let _ = kill(Pid::from_raw(pid_to_check as i32), Signal::SIGKILL);
+            }
+
             let process = self.process(id);
             process.running = false;
             process.crash.crashed = false;
