@@ -17,8 +17,9 @@ use std::{
 };
 
 use nix::{
+    errno::Errno,
     sys::signal::{Signal, kill},
-    unistd::Pid,
+    unistd::{Pid, getpgid, setpgid},
 };
 
 use chrono::serde::ts_milliseconds;
@@ -27,6 +28,7 @@ use global_placeholders::global;
 use macros_rs::{crashln, string, ternary, then};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt;
 use utoipa::ToSchema;
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -230,6 +232,44 @@ fn kill_children(children: Vec<i64>) {
             }
         }
     }
+}
+
+fn signal_process_group(pid: i64, signal: Signal) {
+    let pid = Pid::from_raw(pid as i32);
+    let pgid = match getpgid(Some(pid)) {
+        Ok(pgid) => pgid,
+        Err(Errno::ESRCH) => return,
+        Err(err) => {
+            log::error!("Failed to get pgid for {}: {err:?}", pid);
+            return;
+        }
+    };
+
+    if let Ok(current_pgid) = getpgid(None)
+        && current_pgid == pgid {
+            match kill(pid, signal) {
+                Ok(_) => {}
+                Err(Errno::ESRCH) => {}
+                Err(err) => log::error!("Failed to send {signal:?} to pid {}: {err:?}", pid),
+            }
+            return;
+        }
+
+    match kill(Pid::from_raw(-pgid.as_raw()), signal) {
+        Ok(_) => {}
+        Err(Errno::ESRCH) => {}
+        Err(err) => log::error!("Failed to send {signal:?} to pgid {}: {err:?}", pgid),
+    }
+}
+
+fn wait_for_exit(pid: i64) -> bool {
+    for _ in 0..50 {
+        if unix::NativeProcess::new(pid as u32).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 impl Default for Runner {
@@ -546,23 +586,11 @@ impl Runner {
             let process_to_stop = self.process(id);
             let pid_to_check = process_to_stop.pid;
 
-            kill_children(process_to_stop.children.clone());
-            let _ = process_stop(pid_to_check); // Continue even if stopping fails
-
-            // waiting until Process is terminated
-            for _ in 0..50 {
-                match unix::NativeProcess::new(pid_to_check as u32) {
-                    Ok(_p) => thread::sleep(Duration::from_millis(100)),
-                    Err(_) => break,
-                }
-            }
-
-            if unix::NativeProcess::new(pid_to_check as u32).is_ok() {
-                let children = process_find_children(pid_to_check);
-                for pid in children {
-                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
-                }
-                let _ = kill(Pid::from_raw(pid_to_check as i32), Signal::SIGKILL);
+            signal_process_group(pid_to_check, Signal::SIGINT);
+            let stopped = wait_for_exit(pid_to_check);
+            if !stopped {
+                signal_process_group(pid_to_check, Signal::SIGTERM);
+                let _ = wait_for_exit(pid_to_check);
             }
 
             let process = self.process(id);
@@ -857,23 +885,14 @@ pub fn get_process_cpu_usage_percentage(pid: i64) -> f64 {
 
 /// Stop the process
 pub fn process_stop(pid: i64) -> Result<(), String> {
-    let children = process_find_children(pid);
-
-    // Stop child processes first
-    for child_pid in children {
-        let _ = kill(Pid::from_raw(child_pid as i32), Signal::SIGTERM);
-        // Continue even if stopping child processes fails
+    signal_process_group(pid, Signal::SIGINT);
+    let stopped = wait_for_exit(pid);
+    if !stopped {
+        signal_process_group(pid, Signal::SIGTERM);
+        let _ = wait_for_exit(pid);
     }
 
-    // Stop parent process
-    match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-        Ok(_) => Ok(()),
-        Err(nix::errno::Errno::ESRCH) => {
-            // Process already terminated
-            Ok(())
-        }
-        Err(err) => Err(format!("Failed to stop process {}: {:?}", pid, err)),
-    }
+    Ok(())
 }
 
 /// Find the children of the process
@@ -978,6 +997,14 @@ pub fn process_run(metadata: ProcessMetadata) -> Result<i64, String> {
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .stdin(Stdio::null());
+
+    unsafe {
+        cmd.pre_exec(|| {
+            setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                .map_err(|err| std::io::Error::other(err))?;
+            Ok(())
+        });
+    }
 
     let child = cmd
         .spawn()
